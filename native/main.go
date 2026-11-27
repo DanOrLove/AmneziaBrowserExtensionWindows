@@ -27,8 +27,11 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 )
 
-const proxyAddress = "127.0.0.1:1080"
+const defaultProxyPort = 1080
+const maxProxyPortAttempts = 10
 const maxMessage = 2 * 1024 * 1024
+const defaultDNS = "1.1.1.1"
+const hostVersion = "amnezia-browser-vpn-host 0.3.0 windows"
 
 type request struct {
 	Command string `json:"command"`
@@ -38,19 +41,43 @@ type request struct {
 type response struct {
 	OK      bool   `json:"ok"`
 	Running bool   `json:"running,omitempty"`
+	Port    int    `json:"port,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "proxy" {
-		if len(os.Args) != 3 {
-			os.Exit(2)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version", "-version", "version":
+			fmt.Println(hostVersion)
+			return
+		case "check":
+			if len(os.Args) != 3 {
+				os.Exit(2)
+			}
+			if err := checkConfig(os.Args[2]); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "proxy":
+			if len(os.Args) != 3 && len(os.Args) != 4 {
+				os.Exit(2)
+			}
+			port := defaultProxyPort
+			if len(os.Args) == 4 {
+				parsed, err := strconv.Atoi(os.Args[3])
+				if err != nil || parsed < 1 || parsed > 65535 {
+					os.Exit(2)
+				}
+				port = parsed
+			}
+			if err := runProxy(os.Args[2], port); err != nil {
+				log.Print(err)
+				os.Exit(1)
+			}
+			return
 		}
-		if err := runProxy(os.Args[2]); err != nil {
-			log.Print(err)
-			os.Exit(1)
-		}
-		return
 	}
 	runNativeHost()
 }
@@ -119,14 +146,22 @@ func dataDirectory() (string, error) {
 }
 
 func startProxy(config string) response {
-	if _, err := parseConfig(config); err != nil {
+	cfg, err := parseConfig(config)
+	if err != nil {
+		return response{Message: "Конфиг не подходит для AmneziaWG: " + err.Error()}
+	}
+	if err := resolveEndpoint(cfg); err != nil {
 		return response{Message: "Конфиг не подходит для AmneziaWG: " + err.Error()}
 	}
 	if proxyRunning() {
-		return response{Message: "Локальный прокси уже запущен."}
+		// Подключение другим профилем: перезапускаем туннель с новым конфигом.
+		if stopped := stopProxy(); !stopped.OK {
+			return stopped
+		}
 	}
-	if proxyListening() {
-		return response{Message: "Порт 1080 занят другой программой. Закройте её и повторите подключение."}
+	port := chooseProxyPort()
+	if proxyListening(port) {
+		return response{Message: fmt.Sprintf("Порт %d занят другой программой. Закройте её или задайте переменную AMNEZIA_PROXY_PORT.", port)}
 	}
 	dir, err := dataDirectory()
 	if err != nil {
@@ -145,7 +180,7 @@ func startProxy(config string) response {
 	if err != nil {
 		return response{Message: "Не удалось открыть журнал локального компонента."}
 	}
-	cmd := exec.Command(executable, "proxy", configPath)
+	cmd := exec.Command(executable, "proxy", configPath, strconv.Itoa(port))
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x00000008}
 	if err := cmd.Start(); err != nil {
@@ -153,10 +188,10 @@ func startProxy(config string) response {
 		return response{Message: "Не удалось запустить AmneziaWG: " + err.Error()}
 	}
 	_ = logFile.Close()
-	_ = os.WriteFile(filepath.Join(dir, "proxy.pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0600)
+	_ = writeProxyState(dir, cmd.Process.Pid, port)
 	for attempt := 0; attempt < 100; attempt++ {
-		if proxyListening() && processAlive(cmd.Process.Pid) {
-			return response{OK: true, Running: true, Message: "AmneziaWG-прокси запущен. Трафик браузера пойдёт через туннель."}
+		if proxyListening(port) && processAlive(cmd.Process.Pid) {
+			return response{OK: true, Running: true, Port: port, Message: successMessage(cfg, port)}
 		}
 		if !processAlive(cmd.Process.Pid) {
 			_ = os.Remove(filepath.Join(dir, "proxy.pid"))
@@ -168,7 +203,7 @@ func startProxy(config string) response {
 	_ = cmd.Process.Kill()
 	_ = os.Remove(filepath.Join(dir, "proxy.pid"))
 	_ = os.Remove(configPath)
-	return response{Message: "Прокси не открыл локальный порт за 10 секунд. Проверьте конфиг и журнал."}
+	return response{Message: fmt.Sprintf("Прокси не открыл порт %d за 10 секунд. Проверьте конфиг и журнал.", port)}
 }
 
 func stopProxy() response {
@@ -176,24 +211,21 @@ func stopProxy() response {
 	if err != nil {
 		return response{Message: err.Error()}
 	}
-	pidPath := filepath.Join(dir, "proxy.pid")
-	pidBytes, err := os.ReadFile(pidPath)
-	if err != nil {
-		if !proxyListening() {
-			_ = os.Remove(filepath.Join(dir, "active.conf"))
-			return response{OK: true, Message: "VPN уже отключён."}
+	pid, port, stateErr := readProxyState(dir)
+	if stateErr != nil {
+		for candidate := defaultProxyPort; candidate < defaultProxyPort+maxProxyPortAttempts; candidate++ {
+			if proxyListening(candidate) {
+				return response{Message: "Нашёл локальный прокси, но не его процесс. Остановите его вручную."}
+			}
 		}
-		return response{Message: "Нашёл локальный прокси, но не его процесс. Остановите его вручную."}
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
-	if err != nil || pid < 1 {
-		return response{Message: "Файл состояния локального компонента повреждён."}
+		_ = os.Remove(filepath.Join(dir, "active.conf"))
+		return response{OK: true, Message: "VPN уже отключён."}
 	}
 	if !processAlive(pid) {
-		_ = os.Remove(pidPath)
+		_ = os.Remove(filepath.Join(dir, "proxy.pid"))
 		_ = os.Remove(filepath.Join(dir, "active.conf"))
-		if proxyListening() {
-			return response{Message: "Порт 1080 занят другой программой; её процесс не тронут."}
+		if proxyListening(port) {
+			return response{Message: fmt.Sprintf("Порт %d занят другой программой; её процесс не тронут.", port)}
 		}
 		return response{OK: true, Message: "VPN уже был остановлен."}
 	}
@@ -204,13 +236,13 @@ func stopProxy() response {
 	if err := process.Kill(); err != nil {
 		return response{Message: "Не удалось остановить AmneziaWG: " + err.Error()}
 	}
-	for attempt := 0; attempt < 30 && proxyListening(); attempt++ {
+	for attempt := 0; attempt < 50 && proxyListening(port); attempt++ {
 		time.Sleep(100 * time.Millisecond)
 	}
-	if proxyListening() {
+	if proxyListening(port) {
 		return response{Message: "Локальный прокси всё ещё отвечает; браузерный прокси восстановлен, но процесс требует остановки."}
 	}
-	_ = os.Remove(pidPath)
+	_ = os.Remove(filepath.Join(dir, "proxy.pid"))
 	_ = os.Remove(filepath.Join(dir, "active.conf"))
 	return response{OK: true, Message: "VPN отключён для Chromium."}
 }
@@ -248,8 +280,8 @@ func processImagePath(handle syscall.Handle) (string, error) {
 	return syscall.UTF16ToString(buffer[:size]), nil
 }
 
-func proxyListening() bool {
-	conn, err := net.DialTimeout("tcp", proxyAddress, 150*time.Millisecond)
+func proxyListening(port int) bool {
+	conn, err := net.DialTimeout("tcp", proxyAddress(port), 150*time.Millisecond)
 	if err != nil {
 		return false
 	}
@@ -257,24 +289,97 @@ func proxyListening() bool {
 	return true
 }
 
+func proxyAddress(port int) string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+}
+
+// chooseProxyPort берёт порт из AMNEZIA_PROXY_PORT либо первый свободный,
+// начиная с 1080: этот порт часто занят другими SOCKS-клиентами.
+func chooseProxyPort() int {
+	if raw := strings.TrimSpace(os.Getenv("AMNEZIA_PROXY_PORT")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed < 65536 {
+			return parsed
+		}
+	}
+	for port := defaultProxyPort; port < defaultProxyPort+maxProxyPortAttempts; port++ {
+		if !proxyListening(port) {
+			return port
+		}
+	}
+	return defaultProxyPort
+}
+
+// readProxyState читает PID и порт из файла состояния "PID PORT".
+// Файл старого формата (только PID) тоже поддерживается.
+func readProxyState(dir string) (pid int, port int, err error) {
+	data, err := os.ReadFile(filepath.Join(dir, "proxy.pid"))
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0, 0, errors.New("state file is empty")
+	}
+	pid, err = strconv.Atoi(fields[0])
+	if err != nil || pid < 1 {
+		return 0, 0, errors.New("state file is damaged")
+	}
+	port = defaultProxyPort
+	if len(fields) > 1 {
+		if parsed, parseErr := strconv.Atoi(fields[1]); parseErr == nil && parsed > 0 && parsed < 65536 {
+			port = parsed
+		}
+	}
+	return pid, port, nil
+}
+
+func writeProxyState(dir string, pid, port int) error {
+	data := strconv.Itoa(pid) + " " + strconv.Itoa(port)
+	return os.WriteFile(filepath.Join(dir, "proxy.pid"), []byte(data), 0600)
+}
+
 func proxyRunning() bool {
 	dir, err := dataDirectory()
 	if err != nil {
 		return false
 	}
-	pidBytes, err := os.ReadFile(filepath.Join(dir, "proxy.pid"))
-	if err != nil {
-		return false
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
-	return err == nil && pid > 0 && processAlive(pid) && proxyListening()
+	pid, port, err := readProxyState(dir)
+	return err == nil && processAlive(pid) && proxyListening(port)
 }
 
 type wgConfig struct {
-	addresses []netip.Addr
-	dns       []netip.Addr
-	mtu       int
-	ipc       strings.Builder
+	addresses    []netip.Addr
+	dns          []netip.Addr
+	mtu          int
+	endpointHost string
+	endpointPort string
+	ipc          strings.Builder
+	ignored      []string
+}
+
+// amneziawg-go принимает только эти ключи в IpcSet. Всё остальное (параметры
+// wg-quick вида Table/PreUp, теги J1-J3 из AmneziaWG 1.5 и т.п.) раньше
+// приводило к ошибке "invalid UAPI key" и полному отказу подключения.
+var supportedInterfaceKeys = map[string]bool{
+	"listen_port": true, "fwmark": true, "jc": true, "jmin": true, "jmax": true,
+	"s1": true, "s2": true, "s3": true, "s4": true,
+	"h1": true, "h2": true, "h3": true, "h4": true,
+	"i1": true, "i2": true, "i3": true, "i4": true, "i5": true,
+	"header_protection_key": true, "content_padding_addition": true,
+	"rekey_after_time": true, "rekey_timeout": true, "reject_after_time": true,
+	"keepalive_timeout": true, "max_handshake_attempts": true,
+	"random_trailers": true, "disable_cookies": true,
+}
+
+var supportedPeerKeys = map[string]bool{
+	"protocol_version": true,
+}
+
+func isSupportedKey(section, key string) bool {
+	if section == "interface" {
+		return supportedInterfaceKeys[key]
+	}
+	return supportedPeerKeys[key]
 }
 
 func parseConfig(source string) (*wgConfig, error) {
@@ -363,7 +468,11 @@ func parseConfig(source string) (*wgConfig, error) {
 				ipcKey = strings.ReplaceAll(ipcKey, "cookies", "_cookies")
 				cfg.ipc.WriteString(ipcKey + "=" + flag + "\n")
 			default:
-				cfg.ipc.WriteString(key + "=" + value + "\n")
+				if isSupportedKey(section, key) {
+					cfg.ipc.WriteString(key + "=" + value + "\n")
+				} else {
+					cfg.ignored = append(cfg.ignored, key)
+				}
 			}
 		} else {
 			switch key {
@@ -381,10 +490,14 @@ func parseConfig(source string) (*wgConfig, error) {
 				}
 				cfg.ipc.WriteString("preshared_key=" + hex.EncodeToString(encoded) + "\n")
 			case "endpoint":
-				if _, _, err := net.SplitHostPort(value); err != nil {
+				host, port, err := net.SplitHostPort(value)
+				if err != nil || host == "" || port == "" {
 					return nil, fmt.Errorf("строка %d: неверный Endpoint", lineNo)
 				}
-				cfg.ipc.WriteString("endpoint=" + value + "\n")
+				// amneziawg-go принимает в endpoint только IP:порт, поэтому имя
+				// хоста разрешаем отдельно (resolveEndpoint) перед IpcSet.
+				cfg.endpointHost = host
+				cfg.endpointPort = port
 				seenEndpoint = true
 			case "allowedips":
 				for _, part := range strings.Split(value, ",") {
@@ -398,7 +511,11 @@ func parseConfig(source string) (*wgConfig, error) {
 			case "persistentkeepalive":
 				cfg.ipc.WriteString("persistent_keepalive_interval=" + value + "\n")
 			default:
-				cfg.ipc.WriteString(key + "=" + value + "\n")
+				if isSupportedKey(section, key) {
+					cfg.ipc.WriteString(key + "=" + value + "\n")
+				} else {
+					cfg.ignored = append(cfg.ignored, key)
+				}
 			}
 		}
 	}
@@ -408,7 +525,104 @@ func parseConfig(source string) (*wgConfig, error) {
 	if !seenPrivateKey || !seenPublicKey || !seenEndpoint || !seenAllowedIPs || len(cfg.addresses) == 0 {
 		return nil, errors.New("обязательные поля PrivateKey, Address, PublicKey, Endpoint и AllowedIPs должны быть заполнены")
 	}
+	// SOCKS5 передаёт имена хостов, поэтому без DNS внутри туннеля ничего не
+	// открывается. Если в конфиге DNS не указан, используем публичный резолвер.
+	if len(cfg.dns) == 0 {
+		cfg.dns = []netip.Addr{netip.MustParseAddr(defaultDNS)}
+	}
+	cfg.ignored = uniqueKeys(cfg.ignored)
 	return cfg, nil
+}
+
+func uniqueKeys(keys []string) []string {
+	if len(keys) < 2 {
+		return keys
+	}
+	seen := make(map[string]bool, len(keys))
+	result := keys[:0]
+	for _, key := range keys {
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, key)
+	}
+	return result
+}
+
+// checkConfig печатает разбор конфига без запуска туннеля: удобно проверить,
+// что профиль совместим, и увидеть, какие параметры обфускации применились.
+func checkConfig(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	cfg, err := parseConfig(string(data))
+	if err != nil {
+		return fmt.Errorf("конфиг не подходит для AmneziaWG: %w", err)
+	}
+	if err := resolveEndpoint(cfg); err != nil {
+		fmt.Printf("ВНИМАНИЕ: %v\n", err)
+	}
+
+	fmt.Printf("файл:   %s\n", path)
+	fmt.Printf("адреса: %s\n", joinAddresses(cfg.addresses))
+	fmt.Printf("DNS:    %s\n", joinAddresses(cfg.dns))
+	fmt.Printf("MTU:    %d\n", cfg.mtu)
+
+	secret := map[string]bool{
+		"private_key": true, "public_key": true, "preshared_key": true, "header_protection_key": true,
+	}
+	var interfaceKeys, peerKeys []string
+	section := "interface"
+	for _, line := range strings.Split(cfg.ipc.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		key, value, _ := strings.Cut(line, "=")
+		switch key {
+		case "public_key", "preshared_key", "endpoint", "allowed_ip", "persistent_keepalive_interval", "protocol_version":
+			section = "peer"
+		}
+		if secret[key] {
+			value = "задан"
+		}
+		if len(value) > 48 {
+			value = fmt.Sprintf("%.24s... (%d символов)", value, len(value))
+		}
+		if section == "interface" {
+			interfaceKeys = append(interfaceKeys, key+"="+value)
+		} else {
+			peerKeys = append(peerKeys, key+"="+value)
+		}
+	}
+	fmt.Printf("interface: %s\n", strings.Join(interfaceKeys, ", "))
+	fmt.Printf("peer:      %s\n", strings.Join(peerKeys, ", "))
+	if len(cfg.ignored) > 0 {
+		fmt.Printf("пропущены неподдерживаемые параметры: %s\n", strings.Join(cfg.ignored, ", "))
+	} else {
+		fmt.Println("пропущенных параметров нет")
+	}
+	return nil
+}
+
+func joinAddresses(addresses []netip.Addr) string {
+	if len(addresses) == 0 {
+		return "нет"
+	}
+	parts := make([]string, len(addresses))
+	for i, address := range addresses {
+		parts[i] = address.String()
+	}
+	return strings.Join(parts, ", ")
+}
+
+func successMessage(cfg *wgConfig, port int) string {
+	message := fmt.Sprintf("AmneziaWG-прокси запущен на 127.0.0.1:%d. Трафик браузера пойдёт через туннель.", port)
+	if len(cfg.ignored) > 0 {
+		message += " Пропущены неподдерживаемые параметры: " + strings.Join(cfg.ignored, ", ") + "."
+	}
+	return message
 }
 
 func decodeKey(value string) ([]byte, error) {
@@ -422,7 +636,47 @@ func decodeKey(value string) ([]byte, error) {
 	return raw, nil
 }
 
-func runProxy(configPath string) error {
+// Уровень журнала AmneziaWG. AMNEZIA_LOG_LEVEL=verbose включает подробный вывод
+// (рукопожатия, ошибки) в proxy.log — это основной инструмент диагностики.
+func logLevel() int {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("AMNEZIA_LOG_LEVEL"))) {
+	case "verbose", "debug":
+		return device.LogLevelVerbose
+	case "silent", "off":
+		return device.LogLevelSilent
+	default:
+		return device.LogLevelError
+	}
+}
+
+// resolveEndpoint превращает Endpoint в формат UAPI "IP:порт": библиотека
+// amneziawg-go отвергает доменные имена в endpoint ошибкой ParseAddr.
+func resolveEndpoint(cfg *wgConfig) error {
+	if cfg.endpointPort == "" {
+		return errors.New("в конфиге не задан Endpoint")
+	}
+	if address, err := netip.ParseAddr(cfg.endpointHost); err == nil {
+		cfg.ipc.WriteString("endpoint=" + net.JoinHostPort(address.String(), cfg.endpointPort) + "\n")
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, cfg.endpointHost)
+	if err != nil || len(addresses) == 0 {
+		return fmt.Errorf("не удалось разрешить имя Endpoint %q: %v", cfg.endpointHost, err)
+	}
+	chosen := addresses[0].IP
+	for _, candidate := range addresses {
+		if candidate.IP.To4() != nil {
+			chosen = candidate.IP
+			break
+		}
+	}
+	cfg.ipc.WriteString("endpoint=" + net.JoinHostPort(chosen.String(), cfg.endpointPort) + "\n")
+	return nil
+}
+
+func runProxy(configPath string, port int) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return err
@@ -431,11 +685,14 @@ func runProxy(configPath string) error {
 	if err != nil {
 		return err
 	}
+	if err := resolveEndpoint(cfg); err != nil {
+		return err
+	}
 	tun, tunnel, err := netstack.CreateNetTUN(cfg.addresses, cfg.dns, cfg.mtu)
 	if err != nil {
 		return err
 	}
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, ""))
+	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel(), "amneziawg: "))
 	if err := dev.IpcSet(cfg.ipc.String()); err != nil {
 		dev.Close()
 		return err
@@ -445,7 +702,7 @@ func runProxy(configPath string) error {
 		return err
 	}
 	defer dev.Close()
-	ln, err := net.Listen("tcp", proxyAddress)
+	ln, err := net.Listen("tcp", proxyAddress(port))
 	if err != nil {
 		return err
 	}

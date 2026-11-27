@@ -26,9 +26,9 @@ Chromium extension for sending the browser's web traffic through an AmneziaWG co
 
 ### Требования
 
-- Windows 10/11 x64.
-- Chromium, Google Chrome или Microsoft Edge.
-- Go 1.25 или новее для сборки локального компонента.
+- Windows 10/11 (x64 или ARM64).
+- Chromium, Google Chrome, Microsoft Edge либо другой браузер на Chromium (Chromium, Brave, Vivaldi).
+- Интернет при первой установке: установщик сам скачивает Go и Go-модули (около 150 МБ). Заранее ставить Go не нужно.
 - Конфиг AmneziaWG в формате WireGuard INI (`[Interface]`, `[Peer]`).
 
 Установка и регистрация компонента выполняются для текущего пользователя без прав администратора. Для использования администраторами или другими Windows-учётными записями компонент нужно собрать и зарегистрировать в их профилях.
@@ -36,16 +36,37 @@ Chromium extension for sending the browser's web traffic through an AmneziaWG co
 ### Установка
 
 1. Скачайте ZIP репозитория с GitHub и распакуйте его в постоянную локальную папку. Не удаляйте и не перемещайте папку после регистрации Native Messaging: запись Windows указывает на полный путь к собранной программе.
-2. Дважды нажмите `install.bat`. Установщик проверит Go и архитектуру Windows, соберёт Native Messaging host, зарегистрирует его для Chrome и Edge в HKCU без прав администратора и откроет страницу расширений. При первой сборке Go скачает зависимости, поэтому нужен интернет.
+2. Дважды нажмите `install.bat` — один запуск делает всё:
 
-   Если хотите выполнить команды вручную, откройте PowerShell в корневой папке проекта:
+   - проверяет версию Windows и архитектуру (x64 или ARM64);
+   - проверяет доступ в интернет;
+   - находит Go 1.25+ или скачивает официальную сборку с go.dev и сверяет её SHA-256;
+   - скачивает Go-модули (если proxy.golang.org недоступен, пробует зеркала);
+   - собирает `native\AmneziaBrowserVpnHost.exe` и проверяет, что он запускается;
+   - регистрирует Native Messaging host в HKCU для всех найденных браузеров на Chromium (Chrome, Edge, Chromium, Brave, Vivaldi);
+   - копирует путь к папке `extension` в буфер обмена и открывает страницу расширений.
+
+   Права администратора не нужны, Go устанавливать заранее не нужно. Ход установки пишется в журнал `%LOCALAPPDATA%\AmneziaBrowserVPN\install.log`.
+
+   Дополнительные варианты запуска:
+
+   ```powershell
+   # сразу загрузить расширение в браузер (если он ещё не запущен)
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -AutoLoadExtension
+
+   # свой GOPROXY, если модули не скачиваются напрямую
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Goproxy https://goproxy.io,direct
+
+   # использовать уже установленный Go
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -GoExe "C:\Program Files\Go\bin\go.exe"
+   ```
+
+   Отдельные шаги по-прежнему доступны:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\native\build.ps1
    powershell -ExecutionPolicy Bypass -File .\native\install.ps1
    ```
-
-   Сборка создаёт `native\AmneziaBrowserVpnHost.exe`; регистрация связывает host с ID из `extension\manifest.json`.
 
 3. На открывшейся странице `chrome://extensions` (или `edge://extensions`) включите **Режим разработчика**, нажмите **Загрузить распакованное расширение** и выберите папку `extension` внутри проекта.
 4. Подтвердите разрешения расширения для прокси, настроек приватности и Native Messaging.
@@ -88,19 +109,36 @@ powershell -ExecutionPolicy Bypass -File .\native\install.ps1
 
 1. Если VPN включён, нажмите **Отключить VPN** в расширении.
 2. Откройте страницу расширений и удалите расширение.
-3. Из корневой папки проекта удалите регистрацию Native Messaging:
+3. Из корневой папки проекта запустите `uninstall.bat` (или `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1`). Он остановит туннель, удалит регистрацию Native Messaging для всех браузеров, собранный `.exe`, скачанный Go и папку `%LOCALAPPDATA%\AmneziaBrowserVPN`.
+
+4. Ключ `-KeepData` сохраняет журнал и рабочие файлы, `-Force` отключает подтверждение. Проверьте, что VPN отключён, прежде чем удалять папку данных вручную.
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File .\native\install.ps1 -Uninstall
+   powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -KeepData -Force
    ```
 
-4. При необходимости удалите `%LOCALAPPDATA%\AmneziaBrowserVPN` после проверки, что VPN отключён. В этой папке находятся временная копия активного конфига, PID-файл и журнал.
+### Диагностика
+
+Проверить профиль без подключения (парсинг, параметры обфускации, разрешение Endpoint):
+
+```powershell
+.\native\AmneziaBrowserVpnHost.exe check .\my-profile.conf
+```
+
+Команда печатает адреса, DNS, MTU, применённые параметры AmneziaWG (Jc/Jmin/Jmax, S1-S4, H1-H4, I1-I5), разрешённый IP Endpoint и список пропущенных параметров. Код возврата 1 означает, что конфиг не подходит.
+
+Журналы:
+
+- `%LOCALAPPDATA%\AmneziaBrowserVPN\install.log` — установка и регистрация.
+- `%LOCALAPPDATA%\AmneziaBrowserVPN\proxy.log` — работа туннеля. Для подробного вывода запустите host с переменной `AMNEZIA_LOG_LEVEL=verbose` (или задайте её перед сборкой/запуском из установщика).
+
+Порт локального SOCKS5 выбирается автоматически (1080-1089), потому что 1080 часто занят другими SOCKS-клиентами. Фактический порт возвращается расширению и пишется в `proxy.pid` как `PID PORT`; переменная `AMNEZIA_PROXY_PORT` задаёт порт принудительно.
 
 ### Устранение неполадок
 
 - **«Native host has exited» / компонент не найден:** проверьте, что `native\AmneziaBrowserVpnHost.exe` собран и `native\install.ps1` выполнен из папки, где проект останется установлен. После этого перезапустите браузер.
-- **Ошибка Go при сборке:** установите Go 1.25+ с [официальной страницы загрузки](https://go.dev/dl/) и повторите `native\build.ps1`.
-- **Порт 1080 занят:** закройте программу, которая слушает `127.0.0.1:1080`, и попробуйте подключиться снова.
+- **Ошибка Go при сборке:** установщик скачивает Go сам. Если загрузка не удалась, поставьте Go вручную с [официальной страницы](https://go.dev/dl/) и запустите `install.ps1 -GoExe \"C:\Program Files\Go\bin\go.exe\"`. Подробности — в `%LOCALAPPDATA%\AmneziaBrowserVPN\install.log`.
+- **Порт 1080 занят:** компонент сам выбирает свободный порт в диапазоне 1080-1089 и сообщает его расширению. Если нужен фиксированный порт, задайте переменную окружения `AMNEZIA_PROXY_PORT`.
 - **Сайт не открывается:** проверьте активность и доступность сервера, соответствие `PrivateKey`/`PublicKey`, `Endpoint` и параметров обфускации на стороне сервера. Журнал локального компонента: `%LOCALAPPDATA%\AmneziaBrowserVPN\proxy.log`.
 - **Расширение не управляет прокси или WebRTC:** проверьте политики браузера и другие расширения, которые могут контролировать те же настройки.
 
@@ -117,8 +155,11 @@ powershell -ExecutionPolicy Bypass -File .\native\install.ps1
 
 - `extension/` — Manifest V3, интерфейс, локальные профили и управление прокси Chromium.
 - `native/main.go` — Native Messaging host, конфигурация AmneziaWG через официальную Go-библиотеку и SOCKS5 TCP CONNECT-мост.
-- `native/build.ps1` — сборка Windows x64 исполняемого файла.
-- `native/install.ps1` — регистрация/удаление Native Messaging host для Chrome и Edge текущего пользователя.
+- `install.ps1`, `install.bat` — установка в один запуск: проверки, автоматическая установка Go, сборка, регистрация, открытие браузера.
+- `uninstall.ps1`, `uninstall.bat` — удаление регистрации, данных и скачанных инструментов.
+- `native/common.ps1` — общие функции установщика: журнал, загрузка Go, определение браузеров, вычисление ID расширения.
+- `native/build.ps1` — сборка исполняемого файла (x64/ARM64) с проверкой запуска.
+- `native/install.ps1` — регистрация/удаление Native Messaging host для браузеров на Chromium.
 - `native/THIRD_PARTY.md` — сведения об основной внешней зависимости.
 
 ## English
@@ -134,9 +175,9 @@ powershell -ExecutionPolicy Bypass -File .\native\install.ps1
 
 ### Requirements
 
-- Windows 10/11 x64.
-- Chromium, Google Chrome, or Microsoft Edge.
-- Go 1.25 or later to build the native component.
+- Windows 10/11 (x64 or ARM64).
+- Chromium, Google Chrome, Microsoft Edge, or another Chromium-based browser (Chromium, Brave, Vivaldi).
+- Internet access on first install: the installer downloads Go and the Go modules itself (about 150 MB). Go does not need to be installed beforehand.
 - An AmneziaWG profile in WireGuard INI format (`[Interface]`, `[Peer]`).
 
 The component is built and registered for the current Windows user and does not require administrator rights. Build and register it separately for each Windows account that needs to use it.
@@ -144,16 +185,37 @@ The component is built and registered for the current Windows user and does not 
 ### Installation
 
 1. Download the repository ZIP from GitHub and extract it to a permanent local folder. Do not move or delete that folder after registering Native Messaging: the Windows registry entry contains the absolute path to the host executable.
-2. Double-click `install.bat`. It checks Go and the Windows architecture, builds the Native Messaging host, registers it under HKCU for Chrome and Edge without administrator rights, and opens the extensions page. The first build downloads Go dependencies and needs internet access.
+2. Double-click `install.bat` — a single run does everything:
 
-   To run the commands manually instead, open PowerShell in the project root:
+   - checks the Windows version and architecture (x64 or ARM64);
+   - checks internet access;
+   - finds Go 1.25+ or downloads the official build from go.dev and verifies its SHA-256;
+   - downloads the Go modules (falls back to mirrors when proxy.golang.org is unreachable);
+   - builds `native\AmneziaBrowserVpnHost.exe` and verifies that it starts;
+   - registers the Native Messaging host in HKCU for every Chromium-based browser found (Chrome, Edge, Chromium, Brave, Vivaldi);
+   - copies the `extension` folder path to the clipboard and opens the extensions page.
+
+   No administrator rights and no preinstalled Go are required. The installer writes a log to `%LOCALAPPDATA%\AmneziaBrowserVPN\install.log`.
+
+   Extra options:
+
+   ```powershell
+   # load the extension into the browser right away (when it is not running yet)
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -AutoLoadExtension
+
+   # custom GOPROXY when modules cannot be downloaded directly
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Goproxy https://goproxy.io,direct
+
+   # reuse an existing Go toolchain
+   powershell -ExecutionPolicy Bypass -File .\install.ps1 -GoExe "C:\Program Files\Go\bin\go.exe"
+   ```
+
+   The individual steps remain available:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\native\build.ps1
    powershell -ExecutionPolicy Bypass -File .\native\install.ps1
    ```
-
-   The build creates `native\AmneziaBrowserVpnHost.exe`; registration connects the host to the extension ID in `extension\manifest.json`.
 
 3. On the opened `chrome://extensions` (or `edge://extensions`) page, enable **Developer mode**, choose **Load unpacked**, and select the repository's `extension` folder.
 4. Approve the extension permissions for proxy settings, privacy settings, and Native Messaging.
@@ -201,19 +263,36 @@ Then reload the extension on `chrome://extensions` or `edge://extensions`. Profi
 
 1. If the VPN is connected, click **Disconnect VPN** in the extension.
 2. Remove the extension from the browser's extensions page.
-3. From the project root, remove the Native Messaging registration:
+3. From the project root, run `uninstall.bat` (or `powershell -ExecutionPolicy Bypass -File .\uninstall.ps1`). It stops the tunnel and removes the Native Messaging registration for every browser, the built `.exe`, the downloaded Go toolchain, and `%LOCALAPPDATA%\AmneziaBrowserVPN`.
+
+4. Use `-KeepData` to keep the log and working files and `-Force` to skip the confirmation prompt.
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File .\native\install.ps1 -Uninstall
+   powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -KeepData -Force
    ```
 
-4. If desired, delete `%LOCALAPPDATA%\AmneziaBrowserVPN` after confirming the tunnel is stopped. It contains a temporary active config copy, a PID file, and a log.
+### Diagnostics
+
+Check a profile without connecting (parsing, obfuscation parameters, Endpoint resolution):
+
+```powershell
+.\native\AmneziaBrowserVpnHost.exe check .\my-profile.conf
+```
+
+The command prints addresses, DNS, MTU, the applied AmneziaWG parameters (Jc/Jmin/Jmax, S1-S4, H1-H4, I1-I5), the resolved Endpoint IP and any skipped parameters. Exit code 1 means the profile is not usable.
+
+Logs:
+
+- `%LOCALAPPDATA%\AmneziaBrowserVPN\install.log` — installation and registration.
+- `%LOCALAPPDATA%\AmneziaBrowserVPN\proxy.log` — tunnel runtime. Set `AMNEZIA_LOG_LEVEL=verbose` for detailed output.
+
+The local SOCKS5 port is chosen automatically (1080-1089) because 1080 is often taken by other SOCKS clients. The actual port is returned to the extension and stored in `proxy.pid` as `PID PORT`; `AMNEZIA_PROXY_PORT` pins a specific port.
 
 ### Troubleshooting
 
 - **“Native host has exited” / host not found:** make sure `native\AmneziaBrowserVpnHost.exe` was built and `native\install.ps1` was run from the folder where the project will remain installed. Restart the browser afterward.
-- **Go build error:** install Go 1.25+ from the [official downloads page](https://go.dev/dl/) and rerun `native\build.ps1`.
-- **Port 1080 is busy:** close the application listening on `127.0.0.1:1080` and retry.
+- **Go build error:** the installer downloads Go automatically. If that fails, install Go manually from the [official downloads page](https://go.dev/dl/) and run `install.ps1 -GoExe \"C:\Program Files\Go\bin\go.exe\"`. Details are in `%LOCALAPPDATA%\AmneziaBrowserVPN\install.log`.
+- **Port 1080 is busy:** the component picks the first free port in the 1080-1089 range and reports it to the extension. Set `AMNEZIA_PROXY_PORT` to pin a specific port.
 - **A website does not load:** check server availability, `PrivateKey`/`PublicKey`, `Endpoint`, and the obfuscation parameters configured on the server. The native component log is `%LOCALAPPDATA%\AmneziaBrowserVPN\proxy.log`.
 - **The extension cannot control proxy or WebRTC settings:** check browser policies and other extensions that may control the same settings.
 
@@ -230,6 +309,9 @@ Then reload the extension on `chrome://extensions` or `edge://extensions`. Profi
 
 - `extension/` — Manifest V3 UI, local profile storage, and Chromium proxy control.
 - `native/main.go` — Native Messaging host, AmneziaWG setup using the official Go library, and SOCKS5 TCP CONNECT bridge.
-- `native/build.ps1` — builds the Windows x64 executable.
-- `native/install.ps1` — registers/unregisters the Native Messaging host for the current Chrome/Edge user.
+- `install.ps1`, `install.bat` — one-shot installer: checks, automatic Go setup, build, registration, browser launch.
+- `uninstall.ps1`, `uninstall.bat` — removes the registration, working data, and downloaded tooling.
+- `native/common.ps1` — shared installer helpers: logging, Go download, browser discovery, extension ID.
+- `native/build.ps1` — builds the Windows executable (x64/ARM64) and verifies it starts.
+- `native/install.ps1` — registers/unregisters the Native Messaging host for Chromium-based browsers.
 - `native/THIRD_PARTY.md` — information about the main third-party dependency.

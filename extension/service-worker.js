@@ -13,11 +13,11 @@ function invokeHost(command, config = "") {
   });
 }
 
-function proxyValue() {
+function proxyValue(port) {
   return {
     mode: "fixed_servers",
     rules: {
-      singleProxy: { scheme: "socks5", host: "127.0.0.1", port: PROXY_PORT },
+      singleProxy: { scheme: "socks5", host: "127.0.0.1", port: port || PROXY_PORT },
       bypassList: ["127.0.0.1", "[::1]", "localhost", "<local>"]
     }
   };
@@ -112,12 +112,14 @@ async function connect(profile) {
   let previousWebRTC = oldState[STATE_KEY]?.previousWebRTC;
   if (!oldState[STATE_KEY]?.active) { previousProxy = current; previousWebRTC = currentWebRTC; }
   const response = await invokeHost("start", profile.config);
+  // Компонент выбирает свободный порт: 1080 часто занят другим SOCKS-клиентом.
+  const proxyPort = Number.isInteger(response?.port) ? response.port : PROXY_PORT;
   try {
-    await setProxy(proxyValue());
+    await setProxy(proxyValue(proxyPort));
     await setWebRTCPolicy("disable_non_proxied_udp");
   } catch (error) {
     const stopped = await invokeHost("stop").then(() => true).catch(() => false);
-    const pendingState = { active: true, profileId: profile.id, profileName: profile.name, previousProxy, previousWebRTC, tunnelStopped: stopped };
+    const pendingState = { active: true, profileId: profile.id, profileName: profile.name, proxyPort, previousProxy, previousWebRTC, tunnelStopped: stopped };
     try {
       await restorePreviousProxy(pendingState);
     } catch {
@@ -125,7 +127,7 @@ async function connect(profile) {
     }
     throw error;
   }
-  const state = { active: true, profileId: profile.id, profileName: profile.name, previousProxy, previousWebRTC, startedAt: new Date().toISOString() };
+  const state = { active: true, profileId: profile.id, profileName: profile.name, proxyPort, previousProxy, previousWebRTC, startedAt: new Date().toISOString() };
   await chrome.storage.local.set({ [STATE_KEY]: state });
   return { active: true, message: response.message };
 }
